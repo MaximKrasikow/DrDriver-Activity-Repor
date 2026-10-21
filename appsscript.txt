@@ -1,0 +1,118 @@
+/**
+ * Бэкенд Google Apps Script
+ */
+const FOLDER_ID = '1Sks47o6MQGUWzR-rIx3jXhkWjiw4wrxe';
+
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ status: "error", message: "Сервер занят, повторите попытку" }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  try {
+    var data = JSON.parse(e.postData.contents);
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+    // ==========================================
+    // ШАГ 1: СОХРАНЕНИЕ ТЕКСТОВЫХ ДАННЫХ
+    // ==========================================
+    if (data.action === "TEXT") {
+      var rawName = (data.user && data.user.trim()) ? data.user.trim() : "Без имени";
+      var sheetName = rawName.replace(/[\*\?\/\\\[\]:]/g, '_').substring(0, 50);
+      var sheet = ss.getSheetByName(sheetName);
+
+      if (!sheet) {
+        sheet = ss.insertSheet(sheetName);
+        sheet.appendRow([
+          "Дата и время создания", "Торговая точка", "Показания счетчика",
+          "Мелкие игрушки", "Заманухи", "Проброс", "Проблемы на маршруте", "Фото"
+        ]);
+        sheet.getRange("A1:H1").setFontWeight("bold").setBackground("#e8f0fe");
+        sheet.setFrozenRows(1);
+      }
+
+      sheet.appendRow([
+        data.timestamp || new Date().toLocaleString("ru-RU"),
+        data.pointName || "",
+        data.meter || "",
+        data.smallToys || 0,
+        data.zamanukha || 0,
+        data.probros || "",
+        data.problems || "Нет",
+        data.hasPhoto ? "Загрузка фото..." : "Без фото"
+      ]);
+
+      SpreadsheetApp.flush();
+      
+      return ContentService
+        .createTextOutput(JSON.stringify({ status: "success", row: sheet.getLastRow(), sheetName: sheetName }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // ==========================================
+    // ШАГ 2: СОХРАНЕНИЕ ФОТО
+    // ==========================================
+    if (data.action === "PHOTO") {
+      var targetSheet = ss.getSheetByName(data.sheetName);
+      if (!targetSheet) {
+        return ContentService
+          .createTextOutput(JSON.stringify({ status: "error", message: "Лист водителя не найден" }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+
+      var photoUrl = "";
+
+      try {
+        var dateStr = Utilities.formatDate(new Date(), "GMT+3", "yyyy-MM-dd_HH-mm-ss");
+        var fileName = (data.sheetName || "Фото") + "_" + dateStr + ".jpg";
+
+        var decoded = Utilities.base64Decode(data.photoBase64);
+        var imageBlob = Utilities.newBlob(decoded, "image/jpeg", fileName);
+
+        var uploadedFile = Drive.Files.create({
+          name: fileName,
+          mimeType: "image/jpeg",
+          parents: [FOLDER_ID]
+        }, imageBlob, { fields: "id, webViewLink" });
+
+        try {
+          Drive.Permissions.create({
+            role: "reader",
+            type: "anyone"
+          }, uploadedFile.id);
+        } catch(permErr) {}
+
+        photoUrl = uploadedFile.webViewLink;
+
+      } catch (driveErr) {
+        // Если диск вернул ошибку — передаем ее клиенту, чтобы отчет не стерся из памяти
+        return ContentService
+          .createTextOutput(JSON.stringify({ status: "error", message: "Ошибка Drive API: " + driveErr.message }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+
+      // Запись ссылки: используется каноническая запятая для setFormula
+      if (data.row && data.row <= targetSheet.getLastRow()) {
+        targetSheet.getRange(data.row, 8).setFormula('=HYPERLINK("' + photoUrl + '", "📷 Открыть фото")');
+        SpreadsheetApp.flush();
+      }
+
+      return ContentService
+        .createTextOutput(JSON.stringify({ status: "success", photoUrl: photoUrl }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    return ContentService
+      .createTextOutput(JSON.stringify({ status: "error", message: "Неизвестное действие" }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ status: "error", message: err.toString() }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    try { lock.releaseLock(); } catch(e) {}
+  }
+}
