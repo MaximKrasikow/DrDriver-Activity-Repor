@@ -1,39 +1,35 @@
 // ============================================================================
-// КЛИЕНТСКАЯ ЛОГИКА PWA «ОТЧЕТ ЭКСПЕДИТОРА» — версия 3.2
+// КЛИЕНТСКАЯ ЛОГИКА PWA «ОТЧЕТ ЭКСПЕДИТОРА» — версия 3.3
 // ============================================================================
-// ЧТО НОВОГО В ВЕРСИИ 3.2 (полный список, детали — в помеченных блоках):
-//   1. НЕСКОЛЬКО ФОТО: до MAX_PHOTOS (константа ниже) на один отчет,
-//      с превью-списком и удалением. Настройки сжатия — тоже константы.
-//   2. ЗАЩИТА ОТ ПАДЕНИЯ ПАМЯТИ (OOM): фото декодируется через
-//      createImageBitmap напрямую из файла — БЕЗ гигантской base64-строки
-//      в оперативной памяти. Раньше фото 10-25 МБ разворачивалось целиком
-//      и роняло вкладку на бюджетных телефонах (форма сбрасывалась).
-//   3. ИДЕМПОТЕНТНОСТЬ: каждый отчет несет reportId — сервер не запишет
-//      один отчет дважды (раньше потерянный ответ сервера = дубль строки).
-//   4. ЧЕСТНОЕ ВРЕМЯ: часы телефона выверяются по серверу (timeOffset),
-//      время отчета = время телефона + offset. Без калибровки — время
-//      телефона с пометкой timeSource='device'.
-//   5. «ЯДОВИТАЯ ТАБЛЕТКА» ВЫЛЕЧЕНА: отчет, который сервер ЗАВЕДОМО не
-//      примет (код VALIDATION), откладывается в сторону и НЕ блокирует
-//      отправку остальных (лечит Head-of-Line Blocking).
-//   6. FIFO ПО ИНДЕКСУ: очередь сортируется по числовому индексу by_created,
-//      а не по строковому ключу id.
+// ЧТО НОВОГО В ВЕРСИИ 3.3 (решения владельца; детали — в помеченных блоках):
+//   1. ПОДТВЕРЖДЕНИЕ ОТПРАВКИ: перед сохранением водитель видит окно
+//      «Вы хотите отправить данный отчёт?» с краткой сводкой и кнопками
+//      ДА / НЕТ. «НЕТ» (или Esc, или тап мимо окна) — форма остается как была.
+//   2. ВРЕМЯ УПРОЩЕНО: время заполнения = часы телефона. Одинаково работает
+//      офлайн и онлайн, никакой связи с сервером для этого не нужно.
+//      Калибровка (timeOffset) и пометки timeSource удалены как лишние.
+//   3. ОБРАТНАЯ СОВМЕСТИМОСТЬ УДАЛЕНА: один формат данных, никаких
+//      «страховок для старых версий». Код однозначный.
+//   4. ВЕДУЩИЕ НУЛИ СЧЕТЧИКА: поле идет текстом от телефона до таблицы
+//      (сервер v3.3 ставит текстовый формат перед записью каждой строки).
+//   Из v3.2 сохранены: несколько фото (MAX_PHOTOS), защита памяти (OOM),
+//      reportId (защита от дублей — теперь невидимая, в памяти сервера),
+//      лечение «ядовитой таблетки», FIFO по индексу by_created.
 //   ВАЖНО ПРИ РЕЛИЗЕ: поднимите версию кэша в sw.js, иначе телефоны
 //   продолжат работать со старым app.js из кэша.
 // ============================================================================
 
-const GAS_URL = 'https://script.google.com/macros/s/AKfycbw1bmHzv2bOMZjgJW0VEAZrq4e60sUAurKj_byGl-kjwtOLid4oRRDQ_LGtgwVGdp8/exec';
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbwLZhLhH-wWDQVbjiJPzTwx--2rcgDJDdJK-jFfOAB91rJW8qzDKNgGQwxe4qhzGPO9/exec';
 
 // Таймаут одного запроса отчета, 90 секунд.
 const REQUEST_TIMEOUT_MS = 90000;
 
 // ============================================================================
-// === НАСТРОЙКИ ФОТО И ВРЕМЕНИ — меняются под требования заказчика ===
+// === НАСТРОЙКИ ФОТО — меняются под требования заказчика ===
 // ============================================================================
 const MAX_PHOTOS = 3;        // сколько фото можно приложить к ОДНОМУ отчету
 const PHOTO_MAX_DIM = 1280;  // большая сторона фото после сжатия, пиксели
 const PHOTO_QUALITY = 0.7;   // качество JPEG (0..1): меньше число = меньше файл
-const CALIBRATION_TIMEOUT_MS = 15000; // таймаут запроса «сколько времени на сервере»
 
 // SERVICE WORKER: регистрация офлайн-оболочки
 // sw.js сохраняет файлы интерфейса (HTML/JS/иконки) в память телефона.
@@ -150,42 +146,19 @@ function dbCountActive() {
 
 // ----------------------------------------------------------------------------
 // Самый старый АКТИВНЫЙ отчет — первый кандидат на отправку (FIFO).
-// НОВОЕ (v3.2), две правки:
-//   1) идем по индексу by_created (число, порядок всегда верный);
-//   2) ПРОПУСКАЕМ отложенные (failed=true) — так «ядовитый» отчет, который
-//      сервер отказался принимать, больше НЕ блокирует всю очередь
-//      (лечение Head-of-Line Blocking).
+// Идем по индексу by_created (число, порядок всегда верный) и ПРОПУСКАЕМ
+// отложенные (failed=true) — так «ядовитый» отчет, который сервер отказался
+// принимать, НЕ блокирует всю очередь (лечение Head-of-Line Blocking).
 // ----------------------------------------------------------------------------
 async function dbPeekOldest() {
     const db = await openDB();
-
-    // Путь 1 — основной: индекс по времени создания.
-    const viaIndex = await new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readonly');
-        const store = tx.objectStore(STORE_NAME);
-        // Индекса может не быть, если миграция еще не прошла — тогда путь 2.
-        if (!store.indexNames.contains('by_created')) return resolve(null);
-        const req = store.index('by_created').openCursor(null, 'next');
-        req.onsuccess = () => {
-            const c = req.result;
-            if (!c) return resolve(null);          // активных в индексе нет
-            if (c.value && c.value.failed) { c.continue(); return; }
-            resolve(c.value);
-        };
-        req.onerror = () => reject(req.error);
-    });
-    if (viaIndex) return viaIndex;
-
-    // Путь 2 — страховка: записи без поля createdAt не попадают в индекс.
-    // Если активные записи есть, а индекс пуст — идем по первичному ключу.
-    const active = await dbCountActive();
-    if (active === 0) return null;
     return new Promise((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readonly');
-        const req = tx.objectStore(STORE_NAME).openCursor(null, 'next');
+        // Индекс by_created создается гарантированно при открытии базы (v2)
+        const req = tx.objectStore(STORE_NAME).index('by_created').openCursor(null, 'next');
         req.onsuccess = () => {
             const c = req.result;
-            if (!c) return resolve(null);
+            if (!c) return resolve(null);          // очередь пуста
             if (c.value && c.value.failed) { c.continue(); return; }
             resolve(c.value);
         };
@@ -275,46 +248,6 @@ uIn.value = localStorage.getItem('drv') || '';
 uIn.oninput = () => localStorage.setItem('drv', uIn.value.trim());
 
 // ----------------------------------------------------------------------------
-// НОВОЕ (v3.2): КАЛИБРОВКА ВРЕМЕНИ ПО СЕРВЕРУ.
-// ЗАЧЕМ: заказчику важно честное время заполнения, а часы телефона могут
-// врать. При онлайне узнаем у сервера точное время (doGet отдает serverTime)
-// и запоминаем РАЗНИЦУ (offset). Время отчета = время телефона + offset.
-// Если калибровки не было (нет сети) — время телефона как есть, отчет
-// помечается timeSource='device': сервер поставит по этому полю примечание
-// к ячейке даты в таблице (без отдельной колонки — решено с владельцем).
-// Вызывается фоново при каждом онлайне; троттлинг — не чаще 1 раза в минуту.
-// ----------------------------------------------------------------------------
-const TIME_OFFSET_KEY = 'timeOffset';
-let lastCalibrationAt = 0;
-
-function getTimeOffset() {
-    const raw = localStorage.getItem(TIME_OFFSET_KEY);
-    if (raw === null) return null;      // калибровки никогда не было
-    const n = Number(raw);
-    return isNaN(n) ? null : n;
-}
-
-async function calibrateTime() {
-    if (!navigator.onLine) return;
-    const now = Date.now();
-    if (now - lastCalibrationAt < 60000) return; // не чаще раза в минуту
-    lastCalibrationAt = now;
-    try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), CALIBRATION_TIMEOUT_MS);
-        const r = await fetch(GAS_URL, { method: 'GET', signal: ctrl.signal });
-        clearTimeout(timer);
-        const d = await r.json();
-        if (d && typeof d.serverTime === 'number') {
-            // offset = насколько часы телефона отличаются от серверных
-            localStorage.setItem(TIME_OFFSET_KEY, String(d.serverTime - Date.now()));
-        }
-    } catch (e) {
-        // нет связи / сервер недоступен — тихо оставляем прежний offset
-    }
-}
-
-// ----------------------------------------------------------------------------
 // Обновление статусной строки и плашки сети. Вызывается при старте,
 // при смене сети и при каждом возврате на экран приложения.
 // ----------------------------------------------------------------------------
@@ -334,9 +267,6 @@ async function updateStatusUI() {
     if (navigator.onLine) {
         netStatusEl.className = 'badge online';
         netStatusEl.innerText = '● Подключение: Онлайн';
-
-        // НОВОЕ: фоновая калибровка часов при каждом онлайне (троттлинг внутри)
-        calibrateTime();
 
         if (active > 0) {
             statusEl.innerText = `В очереди: ${active} отчетов` +
@@ -501,30 +431,20 @@ function clearForm() {
 // ============================================================================
 
 async function sendReportToServer(item) {
-    // НОВОЕ (v3.2): ЧЕСТНОЕ ВРЕМЯ. Offset берем СЕЙЧАС (в момент отправки),
-    // а не в момент заполнения — тогда отчет, заполненный офлайн (например,
-    // в подвале магазина), все равно получит правильное время после того,
-    // как телефон выйдет в сеть: honest = сырое время + offset.
-    const offset = getTimeOffset();
-    const honestMs = item.createdAt + (offset === null ? 0 : offset);
-
-    // Единый пакет: текст и ВСЕ фото атомарно одним запросом
+    // Единый пакет: текст и ВСЕ фото атомарно одним запросом.
+    // Формат ОДИН, без вариантов под старые версии (решение владельца v3.3).
     const payload = {
         action: 'REPORT',
-        reportId: item.id,          // НОВОЕ: уникальный id для защиты от дублей
+        reportId: item.id,          // уникальный id: сервер не запишет отчет дважды
         user: item.user,
         pointName: item.pointName,
-        meter: item.meter,
+        meter: item.meter,          // строка как есть: '0057' не равно '57'
         smallToys: item.smallToys,
         zamanukha: item.zamanukha,
         probros: item.probros,
         problems: item.problems,
-        createdAt: honestMs,        // НОВОЕ: честное время в мс — сервер отформатирует
-        timestamp: new Date(honestMs).toLocaleString('ru-RU'), // резерв совместимости
-        timeSource: offset === null ? 'device' : 'server',     // НОВОЕ: источник времени
-        // НОВОЕ: массив фото. Совместимость со старой очередью: если в записи
-        // осталось одиночное photoBase64 (v1) — упаковываем в массив.
-        photos: item.photos || (item.photoBase64 ? [item.photoBase64] : [])
+        createdAt: item.createdAt,  // время заполнения (часы телефона), в мс
+        photos: item.photos || []   // массив Base64, может быть пустым
     };
 
     // Таймаут: AbortController разрывает соединение через 90 секунд.
@@ -586,11 +506,49 @@ async function sendReportToServer(item) {
 }
 
 // ============================================================================
-// БЛОК 5: КНОПКА «ОТПРАВИТЬ ДАННЫЕ»
+// БЛОК 5: КНОПКА «ОТПРАВИТЬ ДАННЫЕ» + ПОДТВЕРЖДЕНИЕ (ДА / НЕТ)
+// ============================================================================
+// НОВОЕ (v3.3): между заполнением и отправкой стоит подтверждение —
+// водитель видит окно «Вы хотите отправить данный отчёт?» с краткой сводкой.
+// «ДА» — продолжаем; «НЕТ», Esc или тап мимо окна — ничего не происходит,
+// форма остается заполненной. Поток: ШАГ 1 (проверка + окно) -> ШАГ 2 (ДА).
 // ============================================================================
 
-async function handleFormSubmit() {
-    // Считываем ВСЕ поля ДО сжатия фото: значения фиксируются в момент нажатия
+const confirmOverlay = document.getElementById('confirmOverlay');
+const confirmSummary = document.getElementById('confirmSummary');
+const confirmYesBtn = document.getElementById('confirmYes');
+const confirmNoBtn = document.getElementById('confirmNo');
+let confirmAction = null; // что выполнить при «ДА»
+
+function askConfirm(summaryText, onYes) {
+    confirmSummary.textContent = summaryText;
+    confirmAction = onYes;
+    confirmOverlay.classList.remove('hidden');
+    confirmYesBtn.focus(); // Enter = «ДА», Esc = «НЕТ»
+}
+
+function hideConfirm() {
+    confirmOverlay.classList.add('hidden');
+    confirmAction = null;
+}
+
+confirmYesBtn.addEventListener('click', () => {
+    const action = confirmAction;
+    hideConfirm();
+    if (action) action();
+});
+confirmNoBtn.addEventListener('click', hideConfirm);
+// Тап по темному фону вокруг окна = «НЕТ»
+confirmOverlay.addEventListener('click', (e) => {
+    if (e.target === confirmOverlay) hideConfirm();
+});
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !confirmOverlay.classList.contains('hidden')) hideConfirm();
+});
+
+// ШАГ 1: прочитать и проверить поля, показать окно подтверждения
+function handleFormSubmit() {
+    // Считываем ВСЕ поля: значения фиксируются в момент нажатия кнопки
     const user = uIn.value.trim();
     const point = pointIn.value.trim();
     const meter = document.getElementById('meter').value.trim();
@@ -599,7 +557,7 @@ async function handleFormSubmit() {
     const probros = document.getElementById('probros').value.trim();
     const problems = document.getElementById('problems').value.trim();
 
-    // НОВОЕ (v3.2): фиксируем список выбранных фото ДО сжатия
+    // Список фото тоже фиксируем сразу — подтверждение ничего не меняет
     const files = selectedPhotos.slice();
 
     if (!user || !point) {
@@ -607,53 +565,65 @@ async function handleFormSubmit() {
         return;
     }
 
+    // Краткая сводка отчета для окна подтверждения. textContent (не innerHTML):
+    // текст точки/проблем вставляется как текст, без интерпретации разметки
+    const summary =
+        'Водитель: ' + user + '\n' +
+        'Точка: ' + point + '\n' +
+        'Счетчик: ' + (meter || '—') + '\n' +
+        'Мелкие: ' + (smallToys || '0') + ' | Заманухи: ' + (zamanukha || '0') + '\n' +
+        'Проброс: ' + (probros || '—') + '\n' +
+        'Проблемы: ' + (problems || 'нет') + '\n' +
+        'Фото: ' + files.length + ' шт.';
+
+    askConfirm(summary, () => processAndSave({
+        user: user, point: point, meter: meter, smallToys: smallToys,
+        zamanukha: zamanukha, probros: probros, problems: problems, files: files
+    }));
+}
+
+// ШАГ 2 (после «ДА»): сжатие фото, запись в базу, выгрузка на сервер
+async function processAndSave(form) {
     // Блокировка кнопки на все время обработки: защита от дублей при
     // нетерпеливых повторных тапах
     submitBtn.disabled = true;
 
     try {
-        // НОВОЕ (v3.2): если часы еще НИКОГДА не калибровали и есть сеть —
-        // сделаем это ПЕРЕД фиксацией времени отчета (быстрый GET, обычно
-        // доли секунды; максимум — CALIBRATION_TIMEOUT_MS и только раз).
-        if (getTimeOffset() === null && navigator.onLine) {
-            statusEl.innerText = 'Сверяю время с сервером...';
-            await calibrateTime();
-        }
-
-        // НОВОЕ (v3.2): сжимаем фото ПО ОДНОМУ — видно прогресс и память
-        // освобождается между файлами (не держим 3 раскрытых фото сразу).
+        // Сжимаем фото ПО ОДНОМУ — видно прогресс и память освобождается
+        // между файлами (не держим 3 раскрытых фото сразу).
         const photosBase64 = [];
-        for (let i = 0; i < files.length; i++) {
-            statusEl.innerText = 'Сжимаю фото ' + (i + 1) + ' из ' + files.length + '...';
+        for (let i = 0; i < form.files.length; i++) {
+            statusEl.innerText = 'Сжимаю фото ' + (i + 1) + ' из ' + form.files.length + '...';
             try {
-                photosBase64.push(await compressImage(files[i]));
+                photosBase64.push(await compressImage(form.files[i]));
             } catch (photoErr) {
                 // Ошибка конкретного фото: объясняем, форму НЕ чистим —
                 // водитель уберет/заменит одно фото и нажмет кнопку снова.
-                statusEl.innerText = 'Фото «' + files[i].name + '» не обработано: ' + photoErr.message +
+                statusEl.innerText = 'Фото «' + form.files[i].name + '» не обработано: ' + photoErr.message +
                     '. Отчет НЕ сохранен — удалите это фото кнопкой ✕ или замените его и нажмите «Отправить».';
                 return; // finally ниже разблокирует кнопку
             }
         }
 
-        // Сырое время устройства — база для FIFO-порядка и для честного времени
-        const rawNow = Date.now();
+        // Время заполнения — часы телефона (Date.now()). Работает ОДИНАКОВО
+        // офлайн и онлайн, никакой связи с сервером для этого не нужно (v3.3).
+        const createdAt = Date.now();
 
-        // Самодостаточный объект отчета. НОВОЕ:
+        // Самодостаточный объект отчета:
         //   photos    — массив Base64 всех фото (может быть пустым);
-        //   createdAt — сырые мс устройства (FIFO-индекс + база честного времени).
+        //   createdAt — время заполнения в мс (FIFO-порядок + колонка в таблице).
         const item = {
-            id: 'rep_' + rawNow + '_' + Math.random().toString(36).substring(2, 7),
-            user: user,
-            pointName: point,
-            meter: meter,
-            smallToys: smallToys,
-            zamanukha: zamanukha,
-            probros: probros,
-            problems: problems,
+            id: 'rep_' + createdAt + '_' + Math.random().toString(36).substring(2, 7),
+            user: form.user,
+            pointName: form.point,
+            meter: form.meter,
+            smallToys: form.smallToys,
+            zamanukha: form.zamanukha,
+            probros: form.probros,
+            problems: form.problems,
             photos: photosBase64,
-            timestamp: new Date(rawNow).toLocaleString('ru-RU'), // показ на экране
-            createdAt: rawNow,
+            timestamp: new Date(createdAt).toLocaleString('ru-RU'), // только для экрана
+            createdAt: createdAt,
             retries: 0,
             lastError: null
         };
@@ -811,9 +781,6 @@ async function doSyncCycle() {
         statusEl.innerText = 'Браузер устарел и не поддерживает локальную базу. Обновите Chrome (Android) или Safari (iPhone).';
         return;
     }
-
-    // НОВОЕ: фоновая калибровка часов по серверу (если онлайн; троттлинг внутри)
-    calibrateTime();
 
     // Первичная проверка сети и очереди
     await updateStatusUI();
