@@ -1,18 +1,10 @@
 <!DOCTYPE html>
-<!-- НОВОЕ (v3.4): добавлены <!DOCTYPE html> и <html lang="ru">. Без доктайпа
-     мобильные браузеры включали Quirks Mode (режим обратной совместимости),
-     в котором flex-раскладка, размеры полей и viewport ведут себя
-     непредсказуемо на разных версиях Android WebView. -->
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <!-- viewport-fit=cover: контент заходит под «челку» iPhone;
-         запрет случайного зума двойным тапом (в полях шрифт 16px,
-         поэтому автозум iOS и так не срабатывает) -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Отчет Водителя</title>
 
-    <!-- ===================== НАСТРОЙКИ PWA ===================== -->
     <link rel="manifest" href="./manifest.json">
     <meta name="theme-color" content="#1971c2">
     <meta name="mobile-web-app-capable" content="yes">
@@ -24,13 +16,13 @@
 
     <style>
         * {
-            box-sizing: border-box;      /* padding не «раздувает» ширину полей */
+            box-sizing: border-box;
             -webkit-tap-highlight-color: transparent;
         }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             padding: 12px;
-            max-width: 500px;            /* на планшетах форма не растягивается */
+            max-width: 500px;
             margin: auto;
             background: #f1f3f5;
             color: #212529;
@@ -72,7 +64,7 @@
         input, textarea {
             width: 100%;
             padding: 11px;
-            font-size: 16px; /* >=16px: иначе iOS Safari сам открывает зум при фокусе */
+            font-size: 16px;
             border: 1px solid #ced4da;
             border-radius: 8px;
             outline: none;
@@ -81,7 +73,7 @@
             user-select: auto;
         }
         input:focus, textarea:focus { border-color: #1971c2; }
-        .row-2 { display: flex; gap: 10px; }       /* две колонки в один ряд */
+        .row-2 { display: flex; gap: 10px; }
         .row-2 .field { flex: 1; }
 
         input[type="file"] {
@@ -90,7 +82,7 @@
             font-size: 14px;
         }
 
-        /* ================= НОВОЕ (v3.2): СПИСОК ВЫБРАННЫХ ФОТО ================= */
+        /* СПИСОК ВЫБРАННЫХ ФОТО */
         /* Превью-строки под полем выбора: имя файла + кнопка удаления */
         .photo-list { margin-top: 8px; }
         .photo-item {
@@ -164,11 +156,10 @@
             word-break: break-word;
         }
 
-        /* ============ НОВОЕ (v3.3): ОКНО ПОДТВЕРЖДЕНИЯ ОТПРАВКИ ============ */
-        /* Темная подложка на весь экран; .hidden прячет окно целиком */
+        /* ОКНО ПОДТВЕРЖДЕНИЯ ОТПРАВКИ */
         .confirm-overlay {
             position: fixed;
-            inset: 0;                    /* закрывает весь экран, включая «челку» */
+            inset: 0;
             background: rgba(0,0,0,0.45);
             display: flex;
             align-items: center;
@@ -176,7 +167,7 @@
             padding: 16px;
             z-index: 1000;
         }
-        .confirm-overlay.hidden { display: none; }
+        .confirm-overlay.hidden { display: none; }        
         .confirm-box {
             background: #ffffff;
             border-radius: 12px;
@@ -204,13 +195,11 @@
             margin-bottom: 14px;
         }
         .confirm-buttons { display: flex; gap: 10px; }
-        /* Две кнопки в ряд (базовый button — width:100%, тут переопределяем) */
         .confirm-buttons button { width: auto; flex: 1; margin-top: 0; }
         .confirm-yes { background: #2b8a3e; }
         .confirm-yes:active { background: #237032; }
         .confirm-no { background: #868e96; }
         .confirm-no:active { background: #6c757d; }
-        /* ==================================================================== */
     </style>
 </head>
 <body>
@@ -218,7 +207,7 @@
         <div id="netStatus" class="badge online">● Подключение: Онлайн</div>
         <h2>Отчет экспедитора</h2>
 
-        <!-- ФИО: сохраняется в localStorage, вводится один раз за смену -->
+        <!-- ФИО: сохраняется в localStorage -->
         <div class="field">
             <label>ФИО Водителя (сохраняется в памяти):</label>
             <input type="text" id="username" placeholder="Иванов Иван" autocomplete="name">
@@ -231,8 +220,6 @@
 
         <div class="field">
             <label>2. Показания счетчика</label>
-            <!-- type="text" + inputmode="numeric": цифровая клавиатура, НО
-                 ведущие нули сохраняются ('0057' — это не '57') -->
             <input type="text" id="meter" inputmode="numeric" pattern="[0-9]*" placeholder="Значение счетчика">
         </div>
 
@@ -263,8 +250,7 @@
                  multiple = можно выбрать сразу несколько файлов галереи -->
             <label>7. Фотографии — счетчик / витрина (до <span id="photoLimit">3</span> шт.)</label>
             <input type="file" id="photo" accept="image/*" multiple>
-            <!-- НОВОЕ (v3.2): превью выбранных фото с кнопками удаления
-                 (заполняется из app.js) -->
+            <!-- превью выбранных фото с кнопками удаления (заполняется из app.js) -->
             <div id="photoList" class="photo-list"></div>
         </div>
 
@@ -273,7 +259,7 @@
         <div id="status">Готово к заполнению</div>
     </div>
 
-    <!-- ================= НОВОЕ (v3.3): ПОДТВЕРЖДЕНИЕ ОТПРАВКИ =================
+    <!-- ПОДТВЕРЖДЕНИЕ ОТПРАВКИ
          Показывается из app.js перед сохранением отчета. Кнопка «ДА» —
          отправить; «НЕТ», Esc или тап по темному фону — закрыть без отправки.
          Сводка отчета (#confirmSummary) заполняется из app.js как текст. -->
@@ -287,9 +273,7 @@
             </div>
         </div>
     </div>
-    <!-- ========================================================================= -->
 
-    <!-- app.js в конце body: все элементы выше уже существуют -->
     <script src="./app.js"></script>
 </body>
 </html>

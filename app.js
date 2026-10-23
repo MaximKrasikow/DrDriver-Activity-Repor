@@ -1,47 +1,20 @@
 // ============================================================================
-// КЛИЕНТСКАЯ ЛОГИКА PWA «ОТЧЕТ ЭКСПЕДИТОРА» — версия 3.4
-// ============================================================================
-// ЧТО НОВОГО В ВЕРСИИ 3.3 (решения владельца; детали — в помеченных блоках):
-//   1. ПОДТВЕРЖДЕНИЕ ОТПРАВКИ: перед сохранением водитель видит окно
-//      «Вы хотите отправить данный отчёт?» с краткой сводкой и кнопками
-//      ДА / НЕТ. «НЕТ» (или Esc, или тап мимо окна) — форма остается как была.
-//   2. ВРЕМЯ УПРОЩЕНО: время заполнения = часы телефона. Одинаково работает
-//      офлайн и онлайн, никакой связи с сервером для этого не нужно.
-//      Калибровка (timeOffset) и пометки timeSource удалены как лишние.
-//   3. ОБРАТНАЯ СОВМЕСТИМОСТЬ УДАЛЕНА: один формат данных, никаких
-//      «страховок для старых версий». Код однозначный.
-//   4. ВЕДУЩИЕ НУЛИ СЧЕТЧИКА: поле идет текстом от телефона до таблицы
-//      (сервер v3.3 ставит текстовый формат перед записью каждой строки).
-//   Из v3.2 сохранены: несколько фото (MAX_PHOTOS), защита памяти (OOM),
-//      reportId (защита от дублей — теперь невидимая, в памяти сервера),
-//      лечение «ядовитой таблетки», FIFO по индексу by_created.
-//   ВАЖНО ПРИ РЕЛИЗЕ: поднимите версию кэша в sw.js, иначе телефоны
-//   продолжат работать со старым app.js из кэша.
-//
-// ЧТО НОВОГО В ВЕРСИИ 3.4 (одна точечная правка, сетевой контракт НЕ менялся):
-//   САМОВОССТАНОВЛЕНИЕ INDEXEDDB: раньше после закрытия базы (смена версии
-//   схемы из другой вкладки либо принудительное закрытие соединения системой
-//   iOS/Android при нехватке памяти) dbPromise продолжал выдавать ЗАКРЫТУЮ
-//   базу — все операции падали с «Ошибка базы данных» до полного перезапуска
-//   приложения. Теперь при любом закрытии кэш соединения сбрасывается, и
-//   следующий же вызов openDB() открывает базу заново. Остальной код v3.3
-//   не тронут — риск регрессий на телефонах водителей нулевой.
+// КЛИЕНТСКАЯ ЛОГИКА PWA «ОТЧЕТ ЭКСПЕДИТОРА» — версия 0.5
 // ============================================================================
 
 const GAS_URL = 'https://script.google.com/macros/s/AKfycbyceW1oRstLa5Vq4HBZOJG-4pgln0Z1GbflV2tuvbsAd-lgQtLw62fNXAzMTVLPbQv9/exec';
 
-// Таймаут одного запроса отчета, 90 секунд.
+// Таймаут одного запроса отчета, 90 секунд. #TODO дописать для чего
 const REQUEST_TIMEOUT_MS = 90000;
 
 // ============================================================================
-// === НАСТРОЙКИ ФОТО — меняются под требования заказчика ===
+// НАСТРОЙКИ ФОТО
 // ============================================================================
 const MAX_PHOTOS = 3;        // сколько фото можно приложить к ОДНОМУ отчету
 const PHOTO_MAX_DIM = 1280;  // большая сторона фото после сжатия, пиксели
 const PHOTO_QUALITY = 0.7;   // качество JPEG (0..1): меньше число = меньше файл
 
 // SERVICE WORKER: регистрация офлайн-оболочки
-// sw.js сохраняет файлы интерфейса (HTML/JS/иконки) в память телефона.
 // ПРИ ОБНОВЛЕНИИ app.js не забывайте менять версию кэша в sw.js!
 if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
@@ -51,18 +24,16 @@ if ('serviceWorker' in navigator) {
     });
 }
 
-// ЗАЩИТА БАЗЫ ОТ АВТООЧИСТКИ БРАУЗЕРА: без этого браузер считает нашу базу
-// «одноразовой» (best-effort) и имеет право стереть неотправленные отчеты
-// при нехватке места на телефоне.
+// ЗАЩИТА БАЗЫ ОТ АВТООЧИСТКИ БРАУЗЕРА
 if (navigator.storage && typeof navigator.storage.persist === 'function') {
     navigator.storage.persist().catch(() => {});
 }
 
-// ============================================================================
-// БЛОК 1: БАЗА ДАННЫХ INDEXEDDB — «диск телефона» для неотправленных отчетов
-// ============================================================================
+// =====================
+// БАЗА ДАННЫХ INDEXEDDB
+// =====================
 const DB_NAME = 'DriverReportsDB';    // имя базы на телефоне
-const DB_VERSION = 2;                 // v2 = добавлен индекс by_created (НОВОЕ)
+const DB_VERSION = 2;                 // v2 = добавлен индекс by_created
 const STORE_NAME = 'reports_queue';   // «таблица» с очередью отчетов
 
 // dbPromise кэширует открытую базу; повторные вызовы openDB() возвращают ее же.
@@ -77,18 +48,10 @@ function openDB() {
         // ИЛИ при обновлении версии схемы (v1 -> v2: добавление индекса)
         req.onupgradeneeded = (e) => {
             const db = e.target.result;
-            // НОВОЕ (v2): store мог уже существовать (обновление с v1) —
-            // берем его из транзакции обновления, а не создаем заново.
             const store = db.objectStoreNames.contains(STORE_NAME)
                 ? e.target.transaction.objectStore(STORE_NAME)
                 : db.createObjectStore(STORE_NAME, { keyPath: 'id' });
 
-            // НОВОЕ (v2): числовой индекс по времени создания.
-            // Раньше FIFO шел по строковому ключу 'rep_<дата>_<мусор>' —
-            // совпадение лексикографического порядка с хронологией было
-            // случайным и сломалось бы при смене формата id. Числа
-            // сортируются всегда правильно. Существующие записи v1
-            // (у них поле createdAt уже было) проиндексируются автоматически.
             if (!store.indexNames.contains('by_created')) {
                 store.createIndex('by_created', 'createdAt');
             }
@@ -96,24 +59,15 @@ function openDB() {
 
         req.onsuccess = () => {
             const db = req.result;
-            // НОВОЕ (v3.4): САМОВОССТАНОВЛЕНИЕ СОЕДИНЕНИЯ.
-            // onversionchange: если когда-нибудь повысим DB_VERSION, открытая
-            // база в других вкладках честно закроется и не будет мешать
-            // обновлению схемы. Раньше после этого закрытый объект продолжал
-            // выдаваться из кэша dbPromise — все операции падали до перезапуска.
-            // Теперь кэш сбрасывается: следующий openDB() откроет базу заново.
             db.onversionchange = () => {
                 try { db.close(); } catch (e) { /* база уже закрыта */ }
                 dbPromise = null;
             };
-            // onclose: аварийное закрытие соединения системой (iOS/Android
-            // выгружают фоновые вкладки при нехватке памяти). Тоже сбрасываем
-            // кэш — приложение лечит себя само без перезапуска.
             db.onclose = () => { dbPromise = null; };
             resolve(db);
         };
         req.onerror = () => {
-            dbPromise = null; // следующая попытка будет с чистого листа
+            dbPromise = null;
             reject(req.error);
         };
     });
@@ -142,13 +96,11 @@ function dbDelete(id) {
     return withStore('readwrite', (store) => store.delete(id));
 }
 
-// Количество ВСЕХ отчетов в очереди (включая отложенные «ядовитые»).
+// Количество ВСЕХ отчетов в очереди.
 function dbCount() {
     return withStore('readonly', (store) => store.count());
 }
 
-// НОВОЕ (v3.2): количество АКТИВНЫХ отчетов (без отложенных failed=true).
-// Отложенные не должны влиять ни на счетчик на экране, ни на запуск синка.
 function dbCountActive() {
     return openDB().then((db) => new Promise((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readonly');
@@ -157,7 +109,7 @@ function dbCountActive() {
         req.onsuccess = () => {
             const c = req.result;
             if (!c) return resolve(n);
-            if (!c.value.failed) n++; // failed=true = отложен, не считаем
+            if (!c.value.failed) n++;
             c.continue();
         };
         req.onerror = () => reject(req.error);
@@ -165,16 +117,13 @@ function dbCountActive() {
 }
 
 // ----------------------------------------------------------------------------
-// Самый старый АКТИВНЫЙ отчет — первый кандидат на отправку (FIFO).
-// Идем по индексу by_created (число, порядок всегда верный) и ПРОПУСКАЕМ
-// отложенные (failed=true) — так «ядовитый» отчет, который сервер отказался
-// принимать, НЕ блокирует всю очередь (лечение Head-of-Line Blocking).
+// Самый старый отчет — первый кандидат на отправку (FIFO).
+// Идем по индексу by_created (число, порядок всегда верный)
 // ----------------------------------------------------------------------------
 async function dbPeekOldest() {
     const db = await openDB();
     return new Promise((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readonly');
-        // Индекс by_created создается гарантированно при открытии базы (v2)
         const req = tx.objectStore(STORE_NAME).index('by_created').openCursor(null, 'next');
         req.onsuccess = () => {
             const c = req.result;
@@ -186,9 +135,9 @@ async function dbPeekOldest() {
     });
 }
 
-// ============================================================================
-// БЛОК 2: ИНТЕРФЕЙС И ДАТЧИКИ СЕТИ
-// ============================================================================
+// ================================
+// ИНТЕРФЕЙС И ДАТЧИКИ СЕТИ
+// ================================
 
 // Ссылки на элементы экрана
 const uIn = document.getElementById('username');
@@ -198,20 +147,14 @@ const statusEl = document.getElementById('status');
 const netStatusEl = document.getElementById('netStatus');
 const submitBtn = document.getElementById('submitBtn');
 
-// НОВОЕ (v3.2): контейнер превью-списка фото и подпись с лимитом
+// Контейнер превью-списка фото и подпись с лимитом
 const photoListEl = document.getElementById('photoList');
 const photoLimitEl = document.getElementById('photoLimit');
 
-// НОВОЕ (v3.2): показываем лимит фото из константы прямо в подписи поля —
-// если поменяете MAX_PHOTOS, надпись на экране обновится сама
 if (photoLimitEl) photoLimitEl.textContent = MAX_PHOTOS;
 
-// ----------------------------------------------------------------------------
-// НОВОЕ (v3.2): МЕНЕДЖЕР ВЫБОРА ФОТО.
-// Состояние — массив File (максимум MAX_PHOTOS). Input после каждого выбора
-// сбрасывается (photoIn.value=''), поэтому один и тот же файл можно выбрать
-// повторно, а «двойной тап» не задублирует его.
-// ----------------------------------------------------------------------------
+// МЕНЕДЖЕР ВЫБОРА ФОТО.
+// Состояние — массив File (максимум MAX_PHOTOS).
 let selectedPhotos = [];
 
 photoIn.addEventListener('change', () => {
@@ -221,7 +164,7 @@ photoIn.addEventListener('change', () => {
         alert('Можно приложить не более ' + MAX_PHOTOS + ' фото. Лишние файлы не добавлены.');
     }
     selectedPhotos = selectedPhotos.concat(incoming.slice(0, Math.max(free, 0)));
-    photoIn.value = ''; // сброс: тот же файл можно выбрать повторно
+    photoIn.value = '';
     renderPhotoList();
 });
 
@@ -251,7 +194,6 @@ function renderPhotoList() {
 }
 
 // Удаление фото из списка: один слушатель на контейнер (делегирование) —
-// работает для любых элементов, перерисовка списка не вешает обработчики.
 if (photoListEl) {
     photoListEl.addEventListener('click', (e) => {
         const btn = e.target.closest('.photo-remove');
@@ -261,16 +203,13 @@ if (photoListEl) {
     });
 }
 
-// ----------------------------------------------------------------------------
 // ФИО водителя — в localStorage (отдельно от базы отчетов).
-// ----------------------------------------------------------------------------
 uIn.value = localStorage.getItem('drv') || '';
 uIn.oninput = () => localStorage.setItem('drv', uIn.value.trim());
 
-// ----------------------------------------------------------------------------
+
 // Обновление статусной строки и плашки сети. Вызывается при старте,
 // при смене сети и при каждом возврате на экран приложения.
-// ----------------------------------------------------------------------------
 async function updateStatusUI() {
     let total = 0;
     let active = 0;
@@ -282,7 +221,7 @@ async function updateStatusUI() {
         statusEl.innerText = 'Ошибка базы данных. Перезапустите приложение.';
         return;
     }
-    const deferred = total - active; // отложенные «ядовитые» отчеты
+    const deferred = total - active;
 
     if (navigator.onLine) {
         netStatusEl.className = 'badge online';
@@ -310,7 +249,7 @@ async function updateStatusUI() {
 }
 
 // ----------------------------------------------------------------------------
-// КОГДА ЗАПУСКАЕТСЯ СИНХРОНИЗАЦИЯ (4 триггера — важно для трассы):
+// КОГДА ЗАПУСКАЕТСЯ СИНХРОНИЗАЦИЯ:
 //   online/offline  — момент смены подключения;
 //   visibilitychange— водитель вернулся в приложение из фона.
 //   focus           — дополнительная подстраховка для десктопа и старых
@@ -324,25 +263,13 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('focus', updateStatusUI);
 
 // ============================================================================
-// БЛОК 3: СЖАТИЕ ФОТОГРАФИЙ (v3.2 — защита от падения памяти)
-// ----------------------------------------------------------------------------
-// ПРОБЛЕМА, КОТОРУЮ ЛЕЧИМ: камера телефона дает фото 10-25 МБ (12-48 Мп).
-// Старый код читал файл через FileReader.readAsDataURL — файл целиком
-// превращался в base64-строку в памяти (20 МБ файл = строка ~27 МБ) и потом
-// РАЗВОРАЧИВАЛСЯ в картинку полного размера (48 Мп = ~190 МБ ОЗУ). На
-// бюджетных телефонах вкладка падала (Out Of Memory) прямо при выборе фото,
-// и форма сбрасывалась.
-// РЕШЕНИЕ: createImageBitmap(file) — браузер декодирует картинку НАПРЯМУЮ
-// из файла: без base64-строки, сразу с правильным поворотом (EXIF). Затем
-// рисуем в уменьшенный canvas и освобождаем память (bmp.close()).
-// Для старых браузеров — запасной путь через Blob-URL: тоже без base64,
-// в разы дешевле по памяти, чем старый readAsDataURL.
+// СЖАТИЕ ФОТОГРАФИЙ
 // ============================================================================
 
 // ----------------------------------------------------------------------------
 // Общая часть обоих путей: уменьшение до PHOTO_MAX_DIM, белая подложка
-// (JPEG не умеет прозрачность — иначе PNG с альфа-каналом станет черным)
-// и конвертация в JPEG-Base64. Размеры и качество — из констант сверху.
+// (JPEG не умеет в прозрачность — иначе PNG с альфа-каналом станет черным)
+// и конвертация в JPEG-Base64. Размеры и качество — из констант.
 // ----------------------------------------------------------------------------
 function canvasToJpegBase64(srcW, srcH, draw) {
     let w = srcW;
@@ -372,43 +299,35 @@ function canvasToJpegBase64(srcW, srcH, draw) {
 }
 
 /**
- * @param {File} file - файл из input или undefined (фото необязательно)
- * @returns {Promise<string|null>} чистый Base64 без data:-заголовка, либо null
+ * @param {File} file
+ * @returns {Promise<string|null>}
  */
 async function compressImage(file) {
-    if (!file) return null; // отчет без фото — валидный отчет
+    if (!file) return null;
 
     // Валидация типа: битый файл или случайный документ — ошибка на экране.
     if (!file.type || !file.type.startsWith('image/')) {
         throw new Error('выбранный файл — не изображение');
     }
 
-    // ПУТЬ 1 (современные Android Chrome / iOS 15+): createImageBitmap.
-    // Декодирует из файла напрямую — пик памяти в разы меньше старого пути.
     if (typeof createImageBitmap === 'function') {
         let bmp = null;
         try {
             try {
-                // from-image = сразу правильный поворот по EXIF
                 bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
             } catch (orientErr) {
-                bmp = await createImageBitmap(file); // опция не поддержана — без поворота
+                bmp = await createImageBitmap(file);
             }
             return canvasToJpegBase64(
                 bmp.width, bmp.height,
                 (ctx, w, h) => ctx.drawImage(bmp, 0, 0, w, h)
             );
         } catch (e) {
-            // декодирование не удалось (битый файл / лимиты браузера) —
-            // падаем в запасной путь ниже
         } finally {
-            // Освобождаем память СРАЗУ после рисования, не ждем GC
             if (bmp && bmp.close) bmp.close();
         }
     }
 
-    // ПУТЬ 2 (старые браузеры): Blob-URL вместо readAsDataURL —
-    // в памяти нет гигантской base64-строки, только сам <img>.
     return new Promise((resolve, reject) => {
         const url = URL.createObjectURL(file);
         const img = new Image();
@@ -433,10 +352,8 @@ async function compressImage(file) {
     });
 }
 
-// ----------------------------------------------------------------------------
 // Очистка полей после УСПЕШНОГО сохранения отчета в базу.
 // ФИО сознательно не чистится. НОВОЕ: сбрасываем и список выбранных фото.
-// ----------------------------------------------------------------------------
 function clearForm() {
     ['pointName', 'meter', 'smallToys', 'zamanukha', 'probros', 'problems', 'photo'].forEach((id) => {
         const el = document.getElementById(id);
@@ -447,24 +364,23 @@ function clearForm() {
 }
 
 // ============================================================================
-// БЛОК 4: ОТПРАВКА ОДНОГО ОТЧЕТА НА СЕРВЕР
+// ОТПРАВКА ОДНОГО ОТЧЕТА НА СЕРВЕР
 // ============================================================================
 
 async function sendReportToServer(item) {
     // Единый пакет: текст и ВСЕ фото атомарно одним запросом.
-    // Формат ОДИН, без вариантов под старые версии (решение владельца v3.3).
     const payload = {
         action: 'REPORT',
         reportId: item.id,          // уникальный id: сервер не запишет отчет дважды
         user: item.user,
         pointName: item.pointName,
-        meter: item.meter,          // строка как есть: '0057' не равно '57'
+        meter: item.meter,          
         smallToys: item.smallToys,
         zamanukha: item.zamanukha,
         probros: item.probros,
         problems: item.problems,
         createdAt: item.createdAt,  // время заполнения (часы телефона), в мс
-        photos: item.photos || []   // массив Base64, может быть пустым
+        photos: item.photos || []   
     };
 
     // Таймаут: AbortController разрывает соединение через 90 секунд.
@@ -504,11 +420,6 @@ async function sendReportToServer(item) {
         }
 
         if (data.status !== 'success') {
-            // НОВОЕ (v3.2): разбор кодов ошибок сервера.
-            // permanent=true ТОЛЬКО если сервер ЯВНО отказал по содержанию
-            // (VALIDATION) — такой отчет не будет принят никогда, и его
-            // нужно отложить в сторону, а не зацикливаться на нем.
-            // BUSY/SERVER/сеть — временные: повтор позже имеет смысл.
             const e = new Error(data.message || 'ошибка обработки отчета на сервере — повторите попытку');
             e.permanent = (data.code === 'VALIDATION');
             throw e;
@@ -521,19 +432,17 @@ async function sendReportToServer(item) {
         }
         throw err;
     } finally {
-        clearTimeout(timer); // не копим «спящие» таймеры после каждого запроса
+        clearTimeout(timer);
     }
 }
 
 // ============================================================================
-// БЛОК 5: КНОПКА «ОТПРАВИТЬ ДАННЫЕ» + ПОДТВЕРЖДЕНИЕ (ДА / НЕТ)
-// ============================================================================
-// НОВОЕ (v3.3): между заполнением и отправкой стоит подтверждение —
-// водитель видит окно «Вы хотите отправить данный отчёт?» с краткой сводкой.
-// «ДА» — продолжаем; «НЕТ», Esc или тап мимо окна — ничего не происходит,
-// форма остается заполненной. Поток: ШАГ 1 (проверка + окно) -> ШАГ 2 (ДА).
+// КНОПКА «ОТПРАВИТЬ ДАННЫЕ» + ПОДТВЕРЖДЕНИЕ (ДА / НЕТ)
 // ============================================================================
 
+// водитель видит окно «Вы хотите отправить данный отчёт?» с краткой сводкой.
+// «ДА» — продолжаем; «НЕТ», Esc или тап мимо окна — ничего не происходит,
+// форма остается заполненной.
 const confirmOverlay = document.getElementById('confirmOverlay');
 const confirmSummary = document.getElementById('confirmSummary');
 const confirmYesBtn = document.getElementById('confirmYes');
@@ -544,7 +453,7 @@ function askConfirm(summaryText, onYes) {
     confirmSummary.textContent = summaryText;
     confirmAction = onYes;
     confirmOverlay.classList.remove('hidden');
-    confirmYesBtn.focus(); // Enter = «ДА», Esc = «НЕТ»
+    confirmYesBtn.focus();
 }
 
 function hideConfirm() {
@@ -558,7 +467,7 @@ confirmYesBtn.addEventListener('click', () => {
     if (action) action();
 });
 confirmNoBtn.addEventListener('click', hideConfirm);
-// Тап по темному фону вокруг окна = «НЕТ»
+
 confirmOverlay.addEventListener('click', (e) => {
     if (e.target === confirmOverlay) hideConfirm();
 });
@@ -577,7 +486,7 @@ function handleFormSubmit() {
     const probros = document.getElementById('probros').value.trim();
     const problems = document.getElementById('problems').value.trim();
 
-    // Список фото тоже фиксируем сразу — подтверждение ничего не меняет
+    // Список фото тоже фиксируем сразу — подтверждение ничего не меняет.
     const files = selectedPhotos.slice();
 
     if (!user || !point) {
@@ -585,8 +494,6 @@ function handleFormSubmit() {
         return;
     }
 
-    // Краткая сводка отчета для окна подтверждения. textContent (не innerHTML):
-    // текст точки/проблем вставляется как текст, без интерпретации разметки
     const summary =
         'Водитель: ' + user + '\n' +
         'Точка: ' + point + '\n' +
@@ -602,15 +509,13 @@ function handleFormSubmit() {
     }));
 }
 
-// ШАГ 2 (после «ДА»): сжатие фото, запись в базу, выгрузка на сервер
+// ШАГ 2 (после «ДА»): сжатие фото, запись в базу, выгрузка на сервер.
 async function processAndSave(form) {
-    // Блокировка кнопки на все время обработки: защита от дублей при
-    // нетерпеливых повторных тапах
+    // Блокировка кнопки на все время обработки: защита от дублей.
     submitBtn.disabled = true;
 
     try {
-        // Сжимаем фото ПО ОДНОМУ — видно прогресс и память освобождается
-        // между файлами (не держим 3 раскрытых фото сразу).
+        // Сжимаем фото ПО ОДНОМУ
         const photosBase64 = [];
         for (let i = 0; i < form.files.length; i++) {
             statusEl.innerText = 'Сжимаю фото ' + (i + 1) + ' из ' + form.files.length + '...';
@@ -626,12 +531,9 @@ async function processAndSave(form) {
         }
 
         // Время заполнения — часы телефона (Date.now()). Работает ОДИНАКОВО
-        // офлайн и онлайн, никакой связи с сервером для этого не нужно (v3.3).
+        // офлайн и онлайн, никакой связи с сервером для этого не нужно.
         const createdAt = Date.now();
 
-        // Самодостаточный объект отчета:
-        //   photos    — массив Base64 всех фото (может быть пустым);
-        //   createdAt — время заполнения в мс (FIFO-порядок + колонка в таблице).
         const item = {
             id: 'rep_' + createdAt + '_' + Math.random().toString(36).substring(2, 7),
             user: form.user,
@@ -642,7 +544,7 @@ async function processAndSave(form) {
             probros: form.probros,
             problems: form.problems,
             photos: photosBase64,
-            timestamp: new Date(createdAt).toLocaleString('ru-RU'), // только для экрана
+            timestamp: new Date(createdAt).toLocaleString('ru-RU'),
             createdAt: createdAt,
             retries: 0,
             lastError: null
@@ -682,14 +584,12 @@ async function processAndSave(form) {
 submitBtn.addEventListener('click', handleFormSubmit);
 
 // ============================================================================
-// БЛОК 6: СИНХРОНИЗАТОР ОЧЕРЕДИ
+// СИНХРОНИЗАТОР ОЧЕРЕДИ
 // ============================================================================
 
-// ----------------------------------------------------------------------------
 // ЗАЩИТА ОТ ДВОЙНОЙ ОТПРАВКИ (замок на уровне всего сайта).
 // Web Locks API — общий замок для всех вкладок; для старых браузеров —
-// резервный флаг isSyncing. (Комментарий про механику — как в v3.1.)
-// ----------------------------------------------------------------------------
+// резервный флаг isSyncing.
 const SYNC_LOCK_NAME = 'driver-report-sync';
 let isSyncing = false;
 
@@ -698,7 +598,7 @@ async function syncQueue() {
 
     if (navigator.locks && typeof navigator.locks.request === 'function') {
         await navigator.locks.request(SYNC_LOCK_NAME, { ifAvailable: true }, async (lock) => {
-            if (!lock) return; // другая вкладка уже выгружает — пропускаем
+            if (!lock) return;
             await doSyncCycle();
         });
     } else {
@@ -712,35 +612,14 @@ async function syncQueue() {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Сам цикл выгрузки. НОВОЕ (v3.2) — лечение «ЯДОВИТОЙ ТАБЛЕТКИ»
-// (Head-of-Line Blocking):
-//   РАНЬШЕ: любая ошибка отчета №1 -> break -> ВСЯ очередь стояла вечно.
-//   ТЕПЕРЬ: ошибка различается по типу:
-//     - err.permanent (код VALIDATION: сервер ЯВНО отказал в приеме —
-//       плохие данные, повтор бессмыслен) -> отчет помечается failed=true
-//       и ОТКЛАДЫВАЕТСЯ (НЕ удаляется — данные дороже!), цикл продолжается
-//       со СЛЕДУЮЩЕГО отчета;
-//     - временные ошибки (сеть, BUSY, 5xx) -> break, как раньше:
-//       повтор при следующем возврате на экран.
-// Отложенные отчеты пропускаются в dbPeekOldest и не мешают никому.
-// ----------------------------------------------------------------------------
 async function doSyncCycle() {
     try {
-        // СТРАХОВКА ОТ ЗАЦИКЛИВАНИЯ: какие отчеты уже обработаны в ЭТОМ цикле.
-        // Нормально обработанный отчет исчезает из очереди активных (failed-флаг
-        // или удаление после success). Но если запись в базу вдруг не прошла
-        // (сбой IndexedDB), на следующей итерации вернулся бы ТОТ ЖЕ отчет,
-        // и цикл крутился бы бесконечно. Set гарантирует: каждый отчет
-        // обрабатывается максимум ОДИН раз за цикл, остальное — до следующего
-        // триггера синхронизации (online/focus/возврат на экран).
         const handledInCycle = new Set();
 
         while (navigator.onLine) {
-            // Берем самый старый АКТИВНЫЙ отчет (отложенные пропускаются)
+            // Берем самый старый АКТИВНЫЙ отчет (отложенные пропускаются) #TODO с отложенными нучно чтот придумать (лог на стороне пользователя, отдельная html страница?)?
             const item = await dbPeekOldest();
-            if (!item || handledInCycle.has(item.id)) break; // пусто ИЛИ уже был в этом цикле
-            handledInCycle.add(item.id);
+            if (!item || handledInCycle.has(item.id)) break;
 
             statusEl.innerText = `Отправка: ${item.pointName} [${item.timestamp}]...`;
 
@@ -748,7 +627,6 @@ async function doSyncCycle() {
                 await sendReportToServer(item);
 
                 // Стирание с телефона — ТОЛЬКО после «success» от сервера.
-                // Дубли на сервере исключены самой проверкой reportId.
                 await dbDelete(item.id);
 
                 const left = await dbCountActive();
@@ -759,26 +637,22 @@ async function doSyncCycle() {
             } catch (err) {
                 console.error('Сбой отправки:', err);
 
-                // Диагностика пишется в отчет в любом случае
                 item.retries = (item.retries || 0) + 1;
                 item.lastError = err.message;
-                if (err.permanent) item.failed = true; // откладываем «навсегда»
+                if (err.permanent) item.failed = true;
 
                 try { await dbPut(item); } catch (dbErr) {}
 
                 if (err.permanent) {
-                    // ЯДОВИТАЯ ТАБЛЕТКА ИЗОЛИРОВАНА: не мешает очереди
                     statusEl.innerText = `Отчет «${item.pointName}» [${item.timestamp}] отложен — сервер его не принимает (${err.message}). Отчет сохранен в памяти, остальные отправляются дальше.`;
-                    continue; // СЛЕДУЮЩИЙ отчет, а не break
+                    continue;
                 }
 
                 statusEl.innerText = `Не отправлено: ${err.message}. Отчет остался в памяти телефона и отправится автоматически позже.`;
-                break; // временная ошибка — ждем восстановления связи
+                break;
             }
         }
 
-        // Итоговая строка статуса. НОВОЕ: учитываем отложенные отдельно,
-        // чтобы «Очередь пуста» не врала при наличии изолированных отчетов.
         const total = await dbCount();
         const active = await dbCountActive();
         if (active === 0) {
@@ -787,14 +661,13 @@ async function doSyncCycle() {
                 : 'Все отчеты отправлены в таблицу! Очередь пуста.';
         }
     } catch (err) {
-        // Ошибки самой базы (открытие/транзакция) — не улетают «в никуда»
         console.error('Критическая ошибка синхронизации:', err);
         statusEl.innerText = 'Ошибка базы данных: ' + err.message + '. Отчеты в безопасности — перезапустите приложение.';
     }
 }
 
 // ============================================================================
-// БЛОК 7: СТАРТ ПРИЛОЖЕНИЯ
+// СТАРТ ПРИЛОЖЕНИЯ
 // ============================================================================
 (async function init() {
     if (!('indexedDB' in window)) {
