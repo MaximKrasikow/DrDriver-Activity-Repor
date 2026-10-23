@@ -19,7 +19,7 @@
 //   продолжат работать со старым app.js из кэша.
 // ============================================================================
 
-const GAS_URL = 'https://script.google.com/macros/s/AKfycbwLZhLhH-wWDQVbjiJPzTwx--2rcgDJDdJK-jFfOAB91rJW8qzDKNgGQwxe4qhzGPO9/exec';
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbyceW1oRstLa5Vq4HBZOJG-4pgln0Z1GbflV2tuvbsAd-lgQtLw62fNXAzMTVLPbQv9/exec';
 
 // Таймаут одного запроса отчета, 90 секунд.
 const REQUEST_TIMEOUT_MS = 90000;
